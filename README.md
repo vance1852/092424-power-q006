@@ -55,6 +55,8 @@ PYTHONPATH=src python3 -m power_dispatch.acceptance --workspace .
 PYTHONPATH=src python3 -m plant_science.acceptance --workspace .
 ```
 
+该命令除登记、导入、封存、分析与决定的主流程外，还会验证：含非法时间格式与负值计数的批次被整批拒绝且不留下观测、幂等键或审计痕迹，请求内重复来源行被整批拒绝，修正后同一幂等键可重试成功，合法批次重放返回同一摘要，以及进程重启（重新打开同一 SQLite 文件）后租约与幂等状态仍可恢复。
+
 ## HTTP 服务
 
 ```bash

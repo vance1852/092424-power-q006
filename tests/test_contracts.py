@@ -57,6 +57,47 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "必须是 0 或 1"):
             Observation.from_dict(raw, self.protocol)
 
+    def _valid_observation(self) -> dict:
+        return {
+            "source_batch": "batch",
+            "source_row": "1",
+            "robot_id": "r1",
+            "protocol_id": self.protocol.protocol_id,
+            "protocol_version": self.protocol.version,
+            "stratum_key": "clear-aisle",
+            "observed_at": "2026-09-21T10:00:00+08:00",
+            "metrics": {"completed": 1, "completion_seconds": 4, "interventions": 0},
+            "excluded_reason": None,
+        }
+
+    def test_observed_at_must_be_iso8601_with_timezone(self) -> None:
+        raw = self._valid_observation()
+        raw["observed_at"] = "2026年9月21日 09:20"
+        with self.assertRaisesRegex(ValidationError, "observation.observed_at 必须是 ISO 8601 时间格式"):
+            Observation.from_dict(raw, self.protocol)
+        raw["observed_at"] = "2026-09-21T09:20:00"
+        with self.assertRaisesRegex(ValidationError, "observation.observed_at 必须携带时区偏移"):
+            Observation.from_dict(raw, self.protocol)
+        raw["observed_at"] = "2026-09-21T09:20:00Z"
+        self.assertEqual(Observation.from_dict(raw, self.protocol).observed_at, "2026-09-21T09:20:00Z")
+
+    def test_count_metric_must_be_non_negative_integer(self) -> None:
+        raw = self._valid_observation()
+        raw["metrics"]["interventions"] = -2
+        with self.assertRaisesRegex(ValidationError, "observation.metrics.interventions 不能为负值") as caught:
+            Observation.from_dict(raw, self.protocol)
+        self.assertEqual(caught.exception.field, "observation.metrics.interventions")
+        raw["metrics"]["interventions"] = "1.5"
+        with self.assertRaisesRegex(ValidationError, "observation.metrics.interventions 必须是整数"):
+            Observation.from_dict(raw, self.protocol)
+
+    def test_protocol_mismatch_names_published_version(self) -> None:
+        raw = self._valid_observation()
+        raw["protocol_version"] = 99
+        with self.assertRaisesRegex(ValidationError, r"demo-delivery-v1@1") as caught:
+            Observation.from_dict(raw, self.protocol)
+        self.assertEqual(caught.exception.field, "observation.protocol_version")
+
 
 if __name__ == "__main__":
     unittest.main()

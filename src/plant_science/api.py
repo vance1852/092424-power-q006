@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +28,14 @@ class JsonApplication:
 
     def __init__(self, service: TrialService) -> None:
         self.service = service
+        self._lock = threading.Lock()
+
+    def handle(
+        self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
+    ) -> Response:
+        # 多线程服务器共享同一个 SQLite 连接，串行分发以保住事务边界。
+        with self._lock:
+            return self._dispatch(method, target, headers, body)
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -47,7 +56,7 @@ class JsonApplication:
             raise ValidationFailed("请求体必须是 JSON 对象")
         return value
 
-    def handle(
+    def _dispatch(
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}
@@ -135,7 +144,10 @@ class JsonApplication:
                 return Response(201, result)
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            error: dict[str, Any] = {"code": exc.code, "message": str(exc)}
+            if exc.details:
+                error["details"] = exc.details
+            return Response(exc.status, {"error": error})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
@@ -173,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
-    connection = connect(args.database)
+    connection = connect(args.database, check_same_thread=False)
     application = JsonApplication(TrialService(connection))
     server = ThreadingHTTPServer((args.host, args.port), make_handler(application))
     try:

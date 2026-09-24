@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
 from plant_science.clock import FrozenClock
-from plant_science.errors import Conflict, Forbidden, InvalidState
+from plant_science.errors import Conflict, Forbidden, InvalidState, ValidationFailed
 from plant_science.jsonio import load_json
 from plant_science.service import TrialService
+from plant_science.storage import connect
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,10 +71,62 @@ class ServiceTests(unittest.TestCase):
 
     def test_import_rolls_back_when_one_source_row_duplicates(self) -> None:
         self.service.import_observations("operator", "batch-a", "key-1", self.rows[:1])
-        with self.assertRaises(Conflict):
+        with self.assertRaises(Conflict) as caught:
             self.service.import_observations("operator", "batch-a", "key-2", self.rows[:2])
+        self.assertIn("hall-a-20260921/001", str(caught.exception))
+        self.assertEqual(caught.exception.details["duplicates"], ["hall-a-20260921/001"])
         count = self.connection.execute("SELECT count(*) FROM observations").fetchone()[0]
         self.assertEqual(count, 1)
+
+    def _import_state(self) -> tuple[int, int, int]:
+        return (
+            self.connection.execute("SELECT count(*) FROM observations").fetchone()[0],
+            self.connection.execute("SELECT count(*) FROM idempotency_keys").fetchone()[0],
+            self.connection.execute("SELECT count(*) FROM audit_events").fetchone()[0],
+        )
+
+    def _corrupted_rows(self) -> list[dict]:
+        bad = [dict(item) for item in self.rows]
+        bad[2] = dict(bad[2])
+        bad[2]["observed_at"] = "2026年9月21日 09:20"
+        bad[2]["metrics"] = {**bad[2]["metrics"], "interventions": -2}
+        return bad
+
+    def test_invalid_row_leaves_no_trace_and_key_stays_reusable(self) -> None:
+        before = self._import_state()
+        with self.assertRaises(ValidationFailed) as caught:
+            self.service.import_observations("operator", "batch-a", "key-1", self._corrupted_rows())
+        message = str(caught.exception)
+        self.assertIn("observation.observed_at", message)
+        self.assertIn("demo-delivery-v1@1", message)
+        self.assertEqual(caught.exception.details["field"], "observation.observed_at")
+        self.assertEqual(caught.exception.details["row"], 3)
+        self.assertEqual(caught.exception.details["protocol"], "demo-delivery-v1@1")
+        self.assertEqual(self._import_state(), before)
+        # 同一幂等键修正重试成功，重放返回同一摘要
+        imported = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        self.assertEqual(imported["inserted"], 6)
+        replay = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        self.assertEqual(replay, imported)
+
+    def test_negative_count_is_rejected_without_pollution(self) -> None:
+        bad = [dict(item) for item in self.rows]
+        bad[1] = dict(bad[1])
+        bad[1]["metrics"] = {**bad[1]["metrics"], "interventions": -1}
+        before = self._import_state()
+        with self.assertRaises(ValidationFailed) as caught:
+            self.service.import_observations("operator", "batch-a", "key-1", bad)
+        self.assertEqual(caught.exception.details["field"], "observation.metrics.interventions")
+        self.assertEqual(caught.exception.details["row"], 2)
+        self.assertEqual(self._import_state(), before)
+
+    def test_duplicate_source_rows_within_request_are_rejected(self) -> None:
+        before = self._import_state()
+        with self.assertRaises(ValidationFailed) as caught:
+            self.service.import_observations("operator", "batch-a", "key-1", [self.rows[0], self.rows[0]])
+        self.assertIn("hall-a-20260921/001", str(caught.exception))
+        self.assertEqual(caught.exception.details["field"], "observation.source_row")
+        self.assertEqual(self._import_state(), before)
 
     def test_role_separation(self) -> None:
         with self.assertRaises(Forbidden):
@@ -118,6 +172,80 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(second["lease_owner"], "worker-b")
         with self.assertRaises(InvalidState):
             self.service.complete_job("worker-a", first["job_id"], "stat")
+
+    def test_analysis_task_requires_statistician_and_lease_owner(self) -> None:
+        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        self.service.seal_batch("stat", "batch-a", 2)
+        job = self.service.claim_job("worker-a", 30)
+        with self.assertRaises(Forbidden):
+            self.service.complete_job("worker-a", job["job_id"], "operator")
+        with self.assertRaises(InvalidState):
+            self.service.fail_job("worker-b", job["job_id"], "越权失败")
+        with self.assertRaises(InvalidState):
+            self.service.complete_job("worker-b", job["job_id"], "stat")
+        # 合法持有者仍可完成，权限检查没有破坏租约流程
+        analysis = self.service.complete_job("worker-a", job["job_id"], "stat")
+        self.assertIn("analysis_id", analysis)
+
+    def test_exclusion_review_and_revoke_permission_isolation(self) -> None:
+        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        observation_id = self.connection.execute(
+            "SELECT observation_id FROM observations ORDER BY observation_id LIMIT 1"
+        ).fetchone()[0]
+        with self.assertRaises(Forbidden):
+            self.service.request_exclusion("stat", observation_id, "统计负责人不能申请排除")
+        requested = self.service.request_exclusion("operator", observation_id, "现场记录失效")
+        with self.assertRaises(Forbidden):
+            self.service.review_exclusion("operator", requested["exclusion_id"], True, "不能自审")
+        with self.assertRaises(Forbidden):
+            self.service.review_exclusion("approver", requested["exclusion_id"], True, "审批人无复核权")
+        reviewed = self.service.review_exclusion("stat", requested["exclusion_id"], True, "证据充分")
+        self.assertEqual(reviewed["status"], "approved")
+        self.service.create_user("operator-2", "operator-2", "operator")
+        with self.assertRaises(Forbidden):
+            self.service.revoke_exclusion("operator-2", requested["exclusion_id"], "非本人申请")
+        revoked = self.service.revoke_exclusion("operator", requested["exclusion_id"], "已找回原始记录")
+        self.assertEqual(revoked["status"], "revoked")
+
+    def test_restart_recovers_import_lease_and_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "restart.sqlite3"
+            connection = connect(database)
+            clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
+            service = TrialService(connection, clock)
+            for user_id, role in (
+                ("operator", "operator"),
+                ("stat", "statistician"),
+                ("approver", "approver"),
+                ("auditor", "auditor"),
+            ):
+                service.create_user(user_id, user_id, role)
+            service.register_robot("operator", "robot-a", "A 型", "厂商")
+            service.register_build("operator", "build-a", "robot-a", "1.0", "b" * 64)
+            service.publish_protocol("stat", self.protocol)
+            service.create_batch("operator", "batch-a", "demo-delivery-v1", 1, "build-a")
+            service.start_batch("operator", "batch-a", 1)
+            with self.assertRaises(ValidationFailed):
+                service.import_observations("operator", "batch-a", "key-1", self._corrupted_rows())
+            imported = service.import_observations("operator", "batch-a", "key-1", self.rows)
+            service.seal_batch("stat", "batch-a", 2)
+            job = service.claim_job("worker-a", 600)
+            connection.close()
+            # 进程重启：同一数据库文件重新建连
+            connection = connect(database)
+            service = TrialService(connection, clock)
+            try:
+                replay = service.import_observations("operator", "batch-a", "key-1", self.rows)
+                self.assertEqual(replay, imported)
+                count = connection.execute("SELECT count(*) FROM observations").fetchone()[0]
+                self.assertEqual(count, 6)
+                analysis = service.complete_job("worker-a", job["job_id"], "stat")
+                service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "重启后完成")
+                report = service.report("auditor", "batch-a")
+                self.assertEqual(report["batch"]["state"], "decided")
+                self.assertEqual(report["analysis"]["result"]["conclusion"], "pass")
+            finally:
+                connection.close()
 
 
 if __name__ == "__main__":

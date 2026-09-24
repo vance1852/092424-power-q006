@@ -18,6 +18,9 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(result["conclusion"], "pass")
         self.assertEqual(result["decision"], "approved")
         self.assertEqual(len(result["input_sha256"]), 64)
+        self.assertEqual(result["rejected_imports"], 2)
+        self.assertTrue(result["replay_consistent"])
+        self.assertTrue(result["restart_recovered"])
 
 
 if __name__ == "__main__":

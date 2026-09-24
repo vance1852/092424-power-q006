@@ -115,7 +115,8 @@ class TrialService:
         try:
             protocol = Protocol.from_dict(raw)
         except ValidationError as exc:
-            raise ValidationFailed(str(exc)) from exc
+            details = {"field": exc.field} if exc.field else None
+            raise ValidationFailed(str(exc), details=details) from exc
         text = canonical_json(raw)
         digest = content_digest([raw])
         try:
@@ -220,23 +221,58 @@ class TrialService:
         if batch["state"] != "running":
             raise InvalidState("只有运行中的批次可以导入测点")
         protocol, _ = self._protocol(batch["protocol_id"], batch["protocol_version"])
+        identity = f"{protocol.protocol_id}@{protocol.version}"
+        build = self.connection.execute(
+            "SELECT robot_id FROM builds WHERE build_id=?", (batch["build_id"],)
+        ).fetchone()
+        # 事务边界：全部行先完成协议校验与冲突检查，任何一行不合法都不会写入
+        # 观测、幂等键或审计状态；通过检查后才在单个事务中落库。
         parsed: list[Observation] = []
-        for raw in rows:
+        seen: dict[tuple[str, str], int] = {}
+        for index, raw in enumerate(rows, start=1):
             try:
                 item = Observation.from_dict(raw, protocol)
             except ValidationError as exc:
-                raise ValidationFailed(str(exc)) from exc
-            if item.robot_id != self.connection.execute(
-                "SELECT robot_id FROM builds WHERE build_id=?", (batch["build_id"],)
-            ).fetchone()["robot_id"]:
-                raise ValidationFailed("测点传感器与批次构建不一致")
+                details: dict[str, Any] = {"protocol": identity, "row": index}
+                if exc.field:
+                    details["field"] = exc.field
+                raise ValidationFailed(
+                    f"第 {index} 行测点不符合已发布协议 {identity}: {exc}",
+                    details=details,
+                ) from exc
+            if item.robot_id != build["robot_id"]:
+                raise ValidationFailed(
+                    f"第 {index} 行测点传感器 {item.robot_id} 与批次构建 {batch['build_id']} 不一致",
+                    details={"protocol": identity, "row": index, "field": "observation.robot_id"},
+                )
+            source = (item.source_batch, item.source_row)
+            if source in seen:
+                raise ValidationFailed(
+                    f"第 {seen[source]} 行与第 {index} 行来源重复: {source[0]}/{source[1]}",
+                    details={"protocol": identity, "row": index, "field": "observation.source_row"},
+                )
+            seen[source] = index
             parsed.append(item)
+        committed = [
+            f"{item.source_batch}/{item.source_row}"
+            for item in parsed
+            if self.connection.execute(
+                "SELECT 1 FROM observations WHERE batch_id=? AND source_batch=? AND source_row=?",
+                (batch_id, item.source_batch, item.source_row),
+            ).fetchone()
+            is not None
+        ]
+        if committed:
+            raise Conflict(
+                f"来源行已存在于批次 {batch_id}: {', '.join(committed)}",
+                details={"protocol": identity, "duplicates": committed},
+            )
         response = {"batch_id": batch_id, "inserted": len(parsed), "request_sha256": request_digest}
         try:
             with transaction(self.connection, immediate=True):
                 for item, raw in zip(parsed, rows):
                     self.connection.execute(
-                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at," 
+                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at,"
                         "metrics_json,content_sha256,imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (
                             batch_id,
