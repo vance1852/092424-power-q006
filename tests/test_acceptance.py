@@ -18,6 +18,11 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(result["conclusion"], "pass")
         self.assertEqual(result["decision"], "approved")
         self.assertEqual(len(result["input_sha256"]), 64)
+        self.assertTrue(result["duplicate_rejected"])
+        self.assertTrue(result["partial_failure_rejected"])
+        self.assertTrue(result["guard_replay_match"])
+        self.assertTrue(result["restart_replay_match"])
+        self.assertTrue(result["restart_job_recovered"])
 
 
 if __name__ == "__main__":

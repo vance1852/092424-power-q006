@@ -210,33 +210,86 @@ class TrialService:
         self._require(actor_id, "observation.import")
         rows = tuple(raw_rows)
         if not rows:
-            raise ValidationFailed("测点数组不能为空")
+            raise ValidationFailed("测点数组不能为空", details={"field": "observations"})
         request_digest = content_digest(rows)
         scope = f"observations:{batch_id}"
-        existing = self._idempotent_response(scope, idempotency_key, request_digest)
-        if existing is not None:
-            return existing
-        batch = self.get_batch(batch_id)
-        if batch["state"] != "running":
-            raise InvalidState("只有运行中的批次可以导入测点")
-        protocol, _ = self._protocol(batch["protocol_id"], batch["protocol_version"])
-        parsed: list[Observation] = []
-        for raw in rows:
-            try:
-                item = Observation.from_dict(raw, protocol)
-            except ValidationError as exc:
-                raise ValidationFailed(str(exc)) from exc
-            if item.robot_id != self.connection.execute(
+
+        # 单一即时事务串行化整个准入过程：幂等重放、批次状态、逐行校验、
+        # 观测写入、幂等键与审计事件要么全部生效，要么全部回滚。
+        with transaction(self.connection, immediate=True):
+            existing = self._idempotent_response(scope, idempotency_key, request_digest)
+            if existing is not None:
+                return existing
+            batch = self.get_batch(batch_id)
+            if batch["state"] != "running":
+                raise InvalidState("只有运行中的批次可以导入测点")
+            protocol, _ = self._protocol(batch["protocol_id"], batch["protocol_version"])
+
+            def invalid(message: str, field: str, index: int, **extra: Any) -> ValidationFailed:
+                details: dict[str, Any] = {
+                    "field": field,
+                    "index": index,
+                    "protocol_id": protocol.protocol_id,
+                    "protocol_version": protocol.version,
+                }
+                details.update(extra)
+                return ValidationFailed(message, details=details)
+
+            build_row = self.connection.execute(
                 "SELECT robot_id FROM builds WHERE build_id=?", (batch["build_id"],)
-            ).fetchone()["robot_id"]:
-                raise ValidationFailed("测点传感器与批次构建不一致")
-            parsed.append(item)
-        response = {"batch_id": batch_id, "inserted": len(parsed), "request_sha256": request_digest}
-        try:
-            with transaction(self.connection, immediate=True):
+            ).fetchone()
+            build_robot = build_row["robot_id"] if build_row is not None else None
+            committed = {
+                (row["source_batch"], row["source_row"])
+                for row in self.connection.execute(
+                    "SELECT source_batch,source_row FROM observations WHERE batch_id=?", (batch_id,)
+                ).fetchall()
+            }
+
+            parsed: list[Observation] = []
+            seen: set[tuple[str, str]] = set()
+            for index, raw in enumerate(rows):
+                try:
+                    item = Observation.from_dict(raw, protocol, index=index)
+                except ValidationError as exc:
+                    raise invalid(
+                        str(exc), exc.field or f"observations[{index}]", index
+                    ) from exc
+                if item.robot_id != build_robot:
+                    raise invalid(
+                        f"observations[{index}].robot_id 测点传感器与批次构建不一致",
+                        f"observations[{index}].robot_id",
+                        index,
+                    )
+                identity = (item.source_batch, item.source_row)
+                if identity in seen:
+                    raise invalid(
+                        f"observations[{index}] 来源行 {identity[0]}/{identity[1]} 在同一请求中重复",
+                        f"observations[{index}].source_row",
+                        index,
+                        source_batch=identity[0],
+                        source_row=identity[1],
+                    )
+                if identity in committed:
+                    raise Conflict(
+                        f"observations[{index}] 来源行 {identity[0]}/{identity[1]} 已经导入本批次",
+                        details={
+                            "field": f"observations[{index}].source_row",
+                            "index": index,
+                            "protocol_id": protocol.protocol_id,
+                            "protocol_version": protocol.version,
+                            "source_batch": identity[0],
+                            "source_row": identity[1],
+                        },
+                    )
+                seen.add(identity)
+                parsed.append(item)
+
+            response = {"batch_id": batch_id, "inserted": len(parsed), "request_sha256": request_digest}
+            try:
                 for item, raw in zip(parsed, rows):
                     self.connection.execute(
-                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at," 
+                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at,"
                         "metrics_json,content_sha256,imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (
                             batch_id,
@@ -256,8 +309,15 @@ class TrialService:
                     (scope, idempotency_key, request_digest, canonical_json(response), self._now()),
                 )
                 self._audit("batch", batch_id, "observations.imported", actor_id, response)
-        except sqlite3.IntegrityError as exc:
-            raise Conflict("来源行重复或幂等键并发冲突") from exc
+            except sqlite3.IntegrityError as exc:
+                # 兜底：写锁内不应再出现竞争，命中说明来源行或幂等键与既有状态冲突。
+                raise Conflict(
+                    "来源行重复或幂等键并发冲突",
+                    details={
+                        "protocol_id": protocol.protocol_id,
+                        "protocol_version": protocol.version,
+                    },
+                ) from exc
         return response
 
     def request_exclusion(self, actor_id: str, observation_id: int, reason: str) -> dict[str, Any]:

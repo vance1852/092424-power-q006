@@ -57,6 +57,54 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "必须是 0 或 1"):
             Observation.from_dict(raw, self.protocol)
 
+    def _base_row(self) -> dict:
+        return {
+            "source_batch": "batch",
+            "source_row": "1",
+            "robot_id": "r1",
+            "protocol_id": self.protocol.protocol_id,
+            "protocol_version": self.protocol.version,
+            "stratum_key": "clear-aisle",
+            "observed_at": "2026-09-21T10:00:00+08:00",
+            "metrics": {"completed": 1, "completion_seconds": 4, "interventions": 0},
+            "excluded_reason": None,
+        }
+
+    def test_observed_at_must_be_timestamp(self) -> None:
+        raw = self._base_row()
+        raw["observed_at"] = "2026/09/21 10:00"
+        with self.assertRaisesRegex(ValidationError, "ISO-8601") as ctx:
+            Observation.from_dict(raw, self.protocol)
+        self.assertEqual(ctx.exception.field, "observation.observed_at")
+
+    def test_observed_at_requires_timezone(self) -> None:
+        raw = self._base_row()
+        raw["observed_at"] = "2026-09-21T10:00:00"
+        with self.assertRaisesRegex(ValidationError, "时区") as ctx:
+            Observation.from_dict(raw, self.protocol)
+        self.assertEqual(ctx.exception.field, "observation.observed_at")
+
+    def test_count_metric_cannot_be_negative(self) -> None:
+        raw = self._base_row()
+        raw["metrics"] = dict(raw["metrics"])
+        raw["metrics"]["interventions"] = -1
+        with self.assertRaisesRegex(ValidationError, "不能为负值") as ctx:
+            Observation.from_dict(raw, self.protocol)
+        self.assertEqual(ctx.exception.field, "observation.metrics.interventions")
+
+    def test_count_metric_must_be_integral(self) -> None:
+        raw = self._base_row()
+        raw["metrics"] = dict(raw["metrics"])
+        raw["metrics"]["interventions"] = "1.5"
+        with self.assertRaisesRegex(ValidationError, "非负整数") as ctx:
+            Observation.from_dict(raw, self.protocol)
+        self.assertEqual(ctx.exception.field, "observation.metrics.interventions")
+
+    def test_indexed_field_path_names_the_failing_row(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            Observation.from_dict("not-an-object", self.protocol, index=2)
+        self.assertEqual(ctx.exception.field, "observations[2]")
+
 
 if __name__ == "__main__":
     unittest.main()

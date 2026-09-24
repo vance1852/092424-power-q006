@@ -62,3 +62,26 @@ PYTHONPATH=src python3 -m power_dispatch.api --database power_dispatch.sqlite3 -
 ```
 
 健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖电价、设施、送出线路、停运事件、燃料批次、提名、能力分配、送电、负荷情景和审计链。服务重启后，SQLite 中的业务状态和历史版本会继续保留。
+
+### 测点分片导入的校验与事务边界
+
+`POST /batches/{batch_id}/observations` 通过 `Idempotency-Key` 实现载荷级幂等。整批测点在**同一个即时事务**内完成幂等重放判定、批次状态门控、逐行协议校验以及观测、幂等键、审计事件的写入：任一行不合法（如 `observed_at` 不是带时区的 ISO-8601 时间、`count` 指标为负数或非整数、引用了错误的协议版本、来源行重复）都会整体回滚，不污染观测、幂等或审计状态；因此失败后可用同一幂等键重试合法数据，合法批次重放始终返回同一摘要。
+
+校验失败的 `422` 响应在 `error.details` 中指出字段与协议版本，例如：
+
+```json
+{
+  "error": {
+    "code": "validation_failed",
+    "message": "observations[2].metrics.interventions 计数不能为负值",
+    "details": {
+      "field": "observations[2].metrics.interventions",
+      "index": 2,
+      "protocol_id": "demo-delivery-v1",
+      "protocol_version": 1
+    }
+  }
+}
+```
+
+批次租约（`/jobs/claim|complete|fail`）、排除复核（申请人与复核人分离）和分析任务执行仍按操作员、统计负责人、审批人、审计人员的角色权限隔离。
